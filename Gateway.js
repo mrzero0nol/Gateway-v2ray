@@ -4,28 +4,16 @@ import { connect } from "cloudflare:sockets";
 let serviceName = "";
 let APP_DOMAIN = "";
 
-let prxIP = "";
-let cachedPrxList = [];
-
 // Constant
 const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
-const v2 = "djJyYXk=";
-const neko = "Y2xhc2g=";
-
-const PORTS = [443, 80];
-const PROTOCOLS = [atob(horse), atob(flash), "ss"];
-const SUB_PAGE_URL = "https://foolvpn.me/nautica";
 const KV_PRX_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/kvProxyList.json";
-const PRX_BANK_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/proxyList.txt";
 const DNS_SERVER_ADDRESS = "8.8.8.8";
 const DNS_SERVER_PORT = 53;
 const RELAY_SERVER_UDP = {
   host: "udp-relay.hobihaus.space", // Kontribusi atau cek relay publik disini: https://hub.docker.com/r/kelvinzer0/udp-relay
   port: 7300,
 };
-const PRX_HEALTH_CHECK_API = "https://id1.foolvpn.me/api/v1/check";
-const CONVERTER_URL = "https://api.foolvpn.me/convert";
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 const CORS_HEADER_OPTIONS = {
@@ -47,38 +35,6 @@ async function getKVPrxList(kvPrxUrl = KV_PRX_URL) {
   }
 }
 
-async function getPrxList(prxBankUrl = PRX_BANK_URL) {
-  /**
-   * Format:
-   *
-   * <IP>,<Port>,<Country ID>,<ORG>
-   * Contoh:
-   * 1.1.1.1,443,SG,Cloudflare Inc.
-   */
-  if (!prxBankUrl) {
-    throw new Error("No URL Provided!");
-  }
-
-  const prxBank = await fetch(prxBankUrl);
-  if (prxBank.status == 200) {
-    const text = (await prxBank.text()) || "";
-
-    const prxString = text.split("\n").filter(Boolean);
-    cachedPrxList = prxString
-      .map((entry) => {
-        const [prxIP, prxPort, country, org] = entry.split(",");
-        return {
-          prxIP: prxIP || "Unknown",
-          prxPort: prxPort || "Unknown",
-          country: country || "Unknown",
-          org: org || "Unknown Org",
-        };
-      })
-      .filter(Boolean);
-  }
-
-  return cachedPrxList;
-}
 
 async function reverseWeb(request, target, targetPath) {
   const targetUrl = new URL(request.url);
@@ -187,152 +143,9 @@ export default {
 
       // Handle prx client
       if (upgradeHeader === "websocket") {
-        const prxMatch = url.pathname.match(/^\/(.+[:=-]\d+)$/);
-
-        if (url.pathname.length == 3 || url.pathname.match(",")) {
-          // Contoh: /ID, /SG, dll
-          const prxKeys = url.pathname.replace("/", "").toUpperCase().split(",");
-          const prxKey = prxKeys[Math.floor(Math.random() * prxKeys.length)];
-          const kvPrx = await getKVPrxList();
-
-          prxIP = kvPrx[prxKey][Math.floor(Math.random() * kvPrx[prxKey].length)];
-
-          return await websocketHandler(request);
-        } else if (prxMatch) {
-          prxIP = prxMatch[1];
-          return await websocketHandler(request);
-        }
+        return await websocketHandler(request);
       }
 
-      if (url.pathname.startsWith("/sub")) {
-        return Response.redirect(SUB_PAGE_URL + `?host=${APP_DOMAIN}`, 301);
-      } else if (url.pathname.startsWith("/check")) {
-        const target = url.searchParams.get("target").split(":");
-        const result = await checkPrxHealth(target[0], target[1] || "443");
-
-        return new Response(JSON.stringify(result), {
-          status: 200,
-          headers: {
-            ...CORS_HEADER_OPTIONS,
-            "Content-Type": "application/json",
-          },
-        });
-      } else if (url.pathname.startsWith("/api/v1")) {
-        const apiPath = url.pathname.replace("/api/v1", "");
-
-        if (apiPath.startsWith("/sub")) {
-          const filterCC = url.searchParams.get("cc")?.split(",") || [];
-          const filterPort = url.searchParams.get("port")?.split(",") || PORTS;
-          const filterVPN = url.searchParams.get("vpn")?.split(",") || PROTOCOLS;
-          const filterLimit = parseInt(url.searchParams.get("limit")) || 10;
-          const filterFormat = url.searchParams.get("format") || "raw";
-          const fillerDomain = url.searchParams.get("domain") || APP_DOMAIN;
-
-          const prxBankUrl = url.searchParams.get("prx-list") || env.PRX_BANK_URL;
-          const prxList = await getPrxList(prxBankUrl)
-            .then((prxs) => {
-              // Filter CC
-              if (filterCC.length) {
-                return prxs.filter((prx) => filterCC.includes(prx.country));
-              }
-              return prxs;
-            })
-            .then((prxs) => {
-              // shuffle result
-              shuffleArray(prxs);
-              return prxs;
-            });
-
-          const uuid = crypto.randomUUID();
-          const result = [];
-          for (const prx of prxList) {
-            const uri = new URL(`${atob(horse)}://${fillerDomain}`);
-            uri.searchParams.set("encryption", "none");
-            uri.searchParams.set("type", "ws");
-            uri.searchParams.set("host", APP_DOMAIN);
-
-            for (const port of filterPort) {
-              for (const protocol of filterVPN) {
-                if (result.length >= filterLimit) break;
-
-                uri.protocol = protocol;
-                uri.port = port.toString();
-                if (protocol == "ss") {
-                  uri.username = btoa(`none:${uuid}`);
-                  uri.searchParams.set(
-                    "plugin",
-                    `${atob(v2)}-plugin${port == 80 ? "" : ";tls"};mux=0;mode=websocket;path=/${prx.prxIP}-${prx.prxPort};host=${APP_DOMAIN}`
-                  );
-                } else {
-                  uri.username = uuid;
-                }
-
-                uri.searchParams.set("security", port == 443 ? "tls" : "none");
-                uri.searchParams.set("sni", port == 80 && protocol == atob(flash) ? "" : APP_DOMAIN);
-                uri.searchParams.set("path", `/${prx.prxIP}-${prx.prxPort}`);
-
-                uri.hash = `${result.length + 1} ${getFlagEmoji(prx.country)} ${prx.org} WS ${port == 443 ? "TLS" : "NTLS"} [${serviceName}]`;
-                result.push(uri.toString());
-              }
-            }
-          }
-
-          let finalResult = "";
-          switch (filterFormat) {
-            case "raw":
-              finalResult = result.join("\n");
-              break;
-            case atob(v2):
-              finalResult = btoa(result.join("\n"));
-              break;
-            case atob(neko):
-            case "sfa":
-            case "bfr":
-              const res = await fetch(CONVERTER_URL, {
-                method: "POST",
-                body: JSON.stringify({
-                  url: result.join(","),
-                  format: filterFormat,
-                  template: "cf",
-                }),
-              });
-              if (res.status == 200) {
-                finalResult = await res.text();
-              } else {
-                return new Response(res.statusText, {
-                  status: res.status,
-                  headers: {
-                    ...CORS_HEADER_OPTIONS,
-                  },
-                });
-              }
-              break;
-          }
-
-          return new Response(finalResult, {
-            status: 200,
-            headers: {
-              ...CORS_HEADER_OPTIONS,
-            },
-          });
-        } else if (apiPath.startsWith("/myip")) {
-          return new Response(
-            JSON.stringify({
-              ip:
-                request.headers.get("cf-connecting-ipv6") ||
-                request.headers.get("cf-connecting-ip") ||
-                request.headers.get("x-real-ip"),
-              colo: request.headers.get("cf-ray")?.split("-")[1],
-              ...request.cf,
-            }),
-            {
-              headers: {
-                ...CORS_HEADER_OPTIONS,
-              },
-            }
-          );
-        }
-      }
 
       const targetReversePrx = env.REVERSE_PRX_TARGET || "example.com";
       const response = await reverseWeb(request, targetReversePrx);
@@ -868,11 +681,6 @@ function safeCloseWebSocket(socket) {
   }
 }
 
-async function checkPrxHealth(prxIP, prxPort) {
-  const req = await fetch(`${PRX_HEALTH_CHECK_API}?ip=${prxIP}:${prxPort}`);
-  return await req.json();
-}
-
 // Helpers
 function base64ToArrayBuffer(base64Str) {
   if (!base64Str) {
@@ -890,30 +698,4 @@ function base64ToArrayBuffer(base64Str) {
 
 function arrayBufferToHex(buffer) {
   return [...new Uint8Array(buffer)].map((x) => x.toString(16).padStart(2, "0")).join("");
-}
-
-function shuffleArray(array) {
-  let currentIndex = array.length;
-
-  // While there remain elements to shuffle...
-  while (currentIndex != 0) {
-    // Pick a remaining element...
-    let randomIndex = Math.floor(Math.random() * currentIndex);
-    currentIndex--;
-
-    // And swap it with the current element.
-    [array[currentIndex], array[randomIndex]] = [array[randomIndex], array[currentIndex]];
-  }
-}
-
-function reverse(s) {
-  return s.split("").reverse().join("");
-}
-
-function getFlagEmoji(isoCode) {
-  const codePoints = isoCode
-    .toUpperCase()
-    .split("")
-    .map((char) => 127397 + char.charCodeAt(0));
-  return String.fromCodePoint(...codePoints);
 }
