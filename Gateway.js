@@ -1,13 +1,27 @@
+import { connect } from "cloudflare:sockets";
+
 // Variables
 let serviceName = "";
 let APP_DOMAIN = "";
 
 let prxIP = "";
+let cachedPrxList = [];
 
 // Constant
 const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
+const v2 = "djJyYXk=";
+const neko = "Y2xhc2g=";
+
+const PORTS = [443, 80];
+const PROTOCOLS = [atob(horse), atob(flash), "ss"];
 const KV_PRX_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/kvProxyList.json";
+const DNS_SERVER_ADDRESS = "8.8.8.8";
+const DNS_SERVER_PORT = 53;
+const RELAY_SERVER_UDP = {
+  host: "udp-relay.hobihaus.space", // Kontribusi atau cek relay publik disini: https://hub.docker.com/r/kelvinzer0/udp-relay
+  port: 7300,
+};
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 const CORS_HEADER_OPTIONS = {
@@ -238,16 +252,37 @@ async function websocketHandler(request) {
           }
 
           if (protocolHeader.isUDP) {
-            // UDP is not supported in this version
-            log(`UDP connection to ${protocolHeader.addressRemote}:${protocolHeader.portRemote} is not supported.`);
-            controller.error("UDP connections are not supported.");
-            return;
+            if (protocolHeader.portRemote === 53) {
+              isDNS = true;
+              return handleUDPOutbound(
+                DNS_SERVER_ADDRESS,
+                DNS_SERVER_PORT,
+                chunk,
+                webSocket,
+                protocolHeader.version,
+                log,
+                RELAY_SERVER_UDP
+              );
+            }
+
+            return handleUDPOutbound(
+              protocolHeader.addressRemote,
+              protocolHeader.portRemote,
+              chunk,
+              webSocket,
+              protocolHeader.version,
+              log,
+              RELAY_SERVER_UDP
+            );
           }
 
           handleTCPOutBound(
             remoteSocketWrapper,
+            protocolHeader.addressRemote,
+            protocolHeader.portRemote,
             protocolHeader.rawClientData,
             webSocket,
+            protocolHeader.version,
             log
           );
         },
@@ -290,76 +325,93 @@ async function protocolSniffer(buffer) {
   return "ss"; // default
 }
 
-async function handleTCPOutBound(remoteSocket, rawClientData, webSocket, log) {
-    const upstreamAddress = prxIP;
-    if (!upstreamAddress) {
-        log("Upstream address (prxIP) is not set. Closing connection.");
-        webSocket.close(1011, "Upstream address not specified in path.");
-        return;
-    }
+async function handleTCPOutBound(
+  remoteSocket,
+  addressRemote,
+  portRemote,
+  rawClientData,
+  webSocket,
+  responseHeader,
+  log
+) {
+  async function connectAndWrite(address, port) {
+    const tcpSocket = connect({
+      hostname: address,
+      port: port,
+    });
+    remoteSocket.value = tcpSocket;
+    log(`connected to ${address}:${port}`);
+    const writer = tcpSocket.writable.getWriter();
+    await writer.write(rawClientData);
+    writer.releaseLock();
 
-    const [upstreamHost, upstreamPortStr] = upstreamAddress.split(/[:=-]/);
-    const upstreamPort = upstreamPortStr ? parseInt(upstreamPortStr) : 443;
-    const scheme = (upstreamPort === 443 || upstreamPort === 2053 || upstreamPort === 2083 || upstreamPort === 2087 || upstreamPort === 2096 || upstreamPort === 8443) ? 'wss' : 'ws';
+    return tcpSocket;
+  }
 
-    log(`Connecting to upstream: ${scheme}://${upstreamHost}:${upstreamPort}/`);
+  async function retry() {
+    const tcpSocket = await connectAndWrite(
+      prxIP.split(/[:=-]/)[0] || addressRemote,
+      prxIP.split(/[:=-]/)[1] || portRemote
+    );
+    tcpSocket.closed
+      .catch((error) => {
+        console.log("retry tcpSocket closed error", error);
+      })
+      .finally(() => {
+        safeCloseWebSocket(webSocket);
+      });
+    remoteSocketToWS(tcpSocket, webSocket, responseHeader, null, log);
+  }
 
-    try {
-        const upgradeHeader = new Headers({ 'Upgrade': 'websocket' });
-        const response = await fetch(`${scheme}://${upstreamHost}:${upstreamPort}/`, {
-            method: 'GET',
-            headers: upgradeHeader,
-        });
+  const tcpSocket = await connectAndWrite(addressRemote, portRemote);
 
-        const upstreamWebSocket = response.webSocket;
-        if (!upstreamWebSocket) {
-            throw new Error(`Upstream server did not upgrade to websocket. Status: ${response.status}`);
-        }
+  remoteSocketToWS(tcpSocket, webSocket, responseHeader, retry, log);
+}
 
-        upstreamWebSocket.accept();
-        log('Successfully connected to upstream.');
+async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log, relay) {
+  try {
+    let protocolHeader = responseHeader;
 
-        // Pipe data from upstream to client
-        upstreamWebSocket.addEventListener('message', (event) => {
-            if (webSocket.readyState === WS_READY_STATE_OPEN) {
-                webSocket.send(event.data);
+    const tcpSocket = connect({
+      hostname: relay.host,
+      port: relay.port,
+    });
+
+    const header = `udp:${targetAddress}:${targetPort}`;
+    const headerBuffer = new TextEncoder().encode(header);
+    const separator = new Uint8Array([0x7c]);
+    const relayMessage = new Uint8Array(headerBuffer.length + separator.length + dataChunk.byteLength);
+    relayMessage.set(headerBuffer, 0);
+    relayMessage.set(separator, headerBuffer.length);
+    relayMessage.set(new Uint8Array(dataChunk), headerBuffer.length + separator.length);
+
+    const writer = tcpSocket.writable.getWriter();
+    await writer.write(relayMessage);
+    writer.releaseLock();
+
+    await tcpSocket.readable.pipeTo(
+      new WritableStream({
+        async write(chunk) {
+          if (webSocket.readyState === WS_READY_STATE_OPEN) {
+            if (protocolHeader) {
+              webSocket.send(await new Blob([protocolHeader, chunk]).arrayBuffer());
+              protocolHeader = null;
+            } else {
+              webSocket.send(chunk);
             }
-        });
-
-        const closeHandler = () => {
-            if (webSocket.readyState === WS_READY_STATE_OPEN) {
-                webSocket.close();
-            }
-            if (upstreamWebSocket.readyState === WS_READY_STATE_OPEN) {
-                upstreamWebSocket.close();
-            }
-        };
-        upstreamWebSocket.addEventListener('close', closeHandler);
-        webSocket.addEventListener('close', closeHandler);
-        upstreamWebSocket.addEventListener('error', () => { log('Upstream WebSocket error.'); closeHandler(); });
-        webSocket.addEventListener('error', () => { log('Client WebSocket error.'); closeHandler(); });
-
-        // This object simulates the writable part of the original tcpSocket
-        const writer = {
-            write: (chunk) => {
-                if (upstreamWebSocket.readyState === WS_READY_STATE_OPEN) {
-                    upstreamWebSocket.send(chunk);
-                } else {
-                    log('Attempted to write to closed upstream WebSocket.');
-                    closeHandler();
-                }
-            },
-            getWriter: function() { return this; },
-            releaseLock: function() {}
-        };
-
-        remoteSocket.value = { writable: writer };
-        writer.write(rawClientData); // Write the initial chunk
-
-    } catch (error) {
-        log(`Error connecting to upstream: ${error.message}`);
-        webSocket.close(1011, "Failed to connect to upstream server.");
-    }
+          }
+        },
+        close() {
+          log(`UDP connection to ${targetAddress} closed`);
+        },
+        abort(reason) {
+          console.error(`UDP connection aborted due to ${reason}`);
+        },
+      })
+    );
+  } catch (e) {
+    console.error(`Error while handling UDP outbound: ${e.message}`);
+  }
 }
 
 function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
@@ -601,6 +653,43 @@ function readHorseHeader(buffer) {
     version: null,
     isUDP: isUDP,
   };
+}
+
+async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, log) {
+  let header = responseHeader;
+  let hasIncomingData = false;
+  await remoteSocket.readable
+    .pipeTo(
+      new WritableStream({
+        start() {},
+        async write(chunk, controller) {
+          hasIncomingData = true;
+          if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+            controller.error("webSocket.readyState is not open, maybe close");
+          }
+          if (header) {
+            webSocket.send(await new Blob([header, chunk]).arrayBuffer());
+            header = null;
+          } else {
+            webSocket.send(chunk);
+          }
+        },
+        close() {
+          log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
+        },
+        abort(reason) {
+          console.error(`remoteConnection!.readable abort`, reason);
+        },
+      })
+    )
+    .catch((error) => {
+      console.error(`remoteSocketToWS has exception `, error.stack || error);
+      safeCloseWebSocket(webSocket);
+    });
+  if (hasIncomingData === false && retry) {
+    log(`retry`);
+    retry();
+  }
 }
 
 function safeCloseWebSocket(socket) {
